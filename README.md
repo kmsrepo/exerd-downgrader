@@ -79,8 +79,11 @@ python3 exerd_downgrader.py info model.exerd
 python3 exerd_downgrader.py downgrade new.exerd old_viewable.exerd \
   --target 2.5.12.20210616-1543
 
-# presets: 2.5-latest, 2.5.12, 2.5.0, 3.0-first
+# presets: 2.5-latest, 2.5.12, 2.5.0, 2.4.7 (2017), 3.0-first
 python3 exerd_downgrader.py downgrade new.exerd old.exerd --target 2.5-latest --force
+
+# downgrade to a 2017-era viewer
+python3 exerd_downgrader.py downgrade new.exerd old2017.exerd --target 2.4.7 --force
 
 # 3.x -> 3.x (keep new fields, only lower the version numbers)
 python3 exerd_downgrader.py downgrade new.exerd older3x.exerd \

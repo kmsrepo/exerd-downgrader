@@ -5,6 +5,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+
+- 2017 downgrade support: `2.4.7` / `2.4-latest` / `2017` presets
+  (`2.4.7.20161226-2038`) in the Python CLI and a `2.4.7 (2017)` preset in
+  `index.html`, plus a test downgrading 2.5.x and 3.x sources to 2017.
+  Works stamps-only — see `FORMAT_HISTORY.md` (2.4.7/2.5.x/3.0.0 ecores
+  are identical).
+
 ## [1.1.0] - 2026-09-04
 
 ### Added

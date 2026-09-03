@@ -25,6 +25,7 @@ from exerd_downgrader import (  # noqa: E402
 
 ORIG_VER = "2.5.0.20180228-1529"
 TARGET_2X = "2.5.12.20210616-1543"
+TARGET_2017 = "2.4.7.20161226-2038"
 SRC_3X_HDR = "3.0.0.20190111-1604"
 SRC_3X_DOC = "3.3.56.20260820-1610"
 
@@ -118,6 +119,33 @@ def test_downgrade_3x_to_2x_strips():
         print("ok - 3.x to 2.x strip", res["xml_info"], res["bin_info"])
 
 
+def test_downgrade_to_2017():
+    # 2018-style (2.5.0) and 2019-style (3.x) files -> 2017 viewer (2.4.7).
+    # Ecore is identical across 2.4.7/2.5.x/3.0.0, so this is stamps-only
+    # (+ stripping the post-3.0 fields for the 3.x file).
+    extra_xml = ' modelVersion="3.0.0.20190111-1604" databaseVersion="3.0.0.20190111-1604"'
+    extra_bin = (encode_compressed_int(len("modelVersion")) + b"modelVersion"
+                 + encode_compressed_int(len(SRC_3X_HDR)) + SRC_3X_HDR.encode())
+    cases = [
+        (ORIG_VER, ORIG_VER, "", b""),
+        (SRC_3X_HDR, SRC_3X_DOC, extra_xml, extra_bin),
+    ]
+    with tempfile.TemporaryDirectory() as td:
+        for i, (hdr_ver, doc_ver, xa, xb) in enumerate(cases):
+            src = pathlib.Path(td) / f"in{i}.exerd"
+            dst = pathlib.Path(td) / f"out{i}.exerd"
+            src.write_bytes(make_minimal_exerd(hdr_ver, doc_ver, xa, xb))
+            downgrade_file(src, dst, TARGET_2017)
+            after = load_exerd(dst)
+            assert after["header"]["version_str"] == TARGET_2017, after["header"]
+            xml = decompress_entry(after["entries"][0]).decode()
+            assert f'version="{TARGET_2017}"' in xml
+            assert "modelVersion" not in xml and "databaseVersion" not in xml
+            raw = decompress_entry(after["entries"][1])
+            assert (encode_compressed_int(len("modelVersion")) + b"modelVersion") not in raw
+    print("ok - downgrade to 2017 (2.5.x and 3.x sources)")
+
+
 def test_keep_new_fields():
     extra_xml = ' modelVersion="3.0.0.20190111-1604"'
     with tempfile.TemporaryDirectory() as td:
@@ -135,5 +163,6 @@ if __name__ == "__main__":
     test_header_roundtrip()
     test_downgrade_2x_to_2x()
     test_downgrade_3x_to_2x_strips()
+    test_downgrade_to_2017()
     test_keep_new_fields()
     print("ALL TESTS PASSED")
