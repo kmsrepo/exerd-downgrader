@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>eXERD file downgrader (offline)</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+         max-width: 860px; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
+  h1 { font-size: 1.5rem; margin-bottom: .25rem; }
+  .sub { color: #666; margin-top: 0; }
+  #drop { border: 2px dashed #888; border-radius: 12px; padding: 2rem 1rem;
+          text-align: center; cursor: pointer; margin: 1rem 0; }
+  #drop.over { border-color: #0a7; background: rgba(0,170,119,.08); }
+  .row { display: flex; gap: .75rem; flex-wrap: wrap; align-items: end; margin: .75rem 0; }
+  label { display: flex; flex-direction: column; gap: .25rem; font-size: .9rem; }
+  input[type=text], select { padding: .45rem .6rem; font-size: 1rem; min-width: 260px; }
+  button { padding: .55rem 1.1rem; font-size: 1rem; cursor: pointer; }
+  button:disabled { opacity: .45; cursor: default; }
+  pre { background: rgba(127,127,127,.12); padding: .8rem; border-radius: 8px;
+        white-space: pre-wrap; word-break: break-word; font-size: .85rem; }
+  .warn { color: #b60; } .ok { color: #0a7; } .err { color: #c22; }
+  footer { margin-top: 2rem; font-size: .8rem; color: #666; }
+  code { background: rgba(127,127,127,.15); padding: 0 .3em; border-radius: 4px; }
+</style>
+</head>
+<body>
+<h1>eXERD file downgrader <small>(100% offline)</small></h1>
+<p class="sub">Lower the <code>.exerd</code> header version so an older eXERD viewer can open a newer file.
+No upload — everything runs in your browser.</p>
+
+<div id="drop">Drop a <b>.exerd</b> file here, or click to choose<input type="file" id="file" accept=".exerd" hidden></div>
+
+<div class="row">
+  <label>Target version (the old viewer’s version)
+    <input type="text" id="target" value="2.5.12.20210616-1543">
+  </label>
+  <label>Preset
+    <select id="preset">
+      <option value="">custom…</option>
+      <option value="2.5.17.20220110-1118">2.5-latest = 2.5.17.20220110-1118</option>
+      <option value="2.5.12.20210616-1543" selected>2.5.12 = 2.5.12.20210616-1543</option>
+      <option value="2.5.0.20180228-1529">2.5.0 = 2.5.0.20180228-1529</option>
+      <option value="3.0.0.20190111-1604">3.0-first = 3.0.0.20190111-1604</option>
+    </select>
+  </label>
+</div>
+<div class="row">
+  <label style="flex-direction:row; align-items:center; gap:.4rem;">
+    <input type="checkbox" id="strip" checked>
+    Strip/neutralise 3.x-only fields (recommended for 2.x targets)
+  </label>
+</div>
+<div class="row">
+  <button id="dl" disabled>Downgrade &amp; download</button>
+  <span id="fname"></span>
+</div>
+
+<h2>File info</h2>
+<pre id="info">No file loaded.</pre>
+
+<h2>Log</h2>
+<pre id="log">Ready. Pick a .exerd file.</pre>
+
+<footer>
+  Offline single file. Bypass gate: <code>ErdResourceImpl.doLoad</code> throws when
+  <code>header.version &gt; installedVersion</code> (“문서의 버전…보다 높아서 열 수 없습니다”).
+  This rewrites header + <code>xml-content.xml</code>/<code>binary-content</code> versions and,
+  for 2.x targets, removes/renames <code>modelVersion</code>, <code>databaseVersion</code>,
+  <code>useClearTableName</code>. Keep a backup of the original.
+</footer>
+
+<script>
+"use strict";
+/* ============ OSGi version ============ */
+function parseOSGI(s){
+  s = String(s).trim().replace(/^v/,"");
+  const p = s.split(".");
+  const major = parseInt(p[0]||"0",10), minor = parseInt(p[1]||"0",10), micro = parseInt(p[2]||"0",10);
+  if ([major,minor,micro].some(v=>!Number.isInteger(v)||v<0)) throw new Error("bad version: "+s);
+  const qual = p.length>3 ? p.slice(3).join(".") : "";
+  return [major,minor,micro,qual];
+}
+function formatOSGI(v){ return v[3] ? `${v[0]}.${v[1]}.${v[2]}.${v[3]}` : `${v[0]}.${v[1]}.${v[2]}`; }
+function compareOSGI(a,b){
+  for(let i=0;i<3;i++){ if(a[i]!==b[i]) return a[i]<b[i]?-1:1; }
+  if(a[3]===b[3]) return 0;
+  if(a[3]==="") return -1;
+  if(b[3]==="") return 1;
+  return a[3]<b[3]?-1:1;
+}
+/* ============ EMF compressed-int ============ */
+function encCI(v){
+  let n = v+1;
+  const b3=(n>>>24)&255,b2=(n>>>16)&255,b1=(n>>>8)&255,b0=n&255;
+  if(b3!==0) return Uint8Array.of(b3|0xC0,b2,b1,b0);
+  if(b2>63)  return Uint8Array.of(b3|0xC0,b2,b1,b0);
+  if(b2!==0) return Uint8Array.of(b2|0x80,b1,b0);
+  if(b1!==0) return Uint8Array.of(b1|0x40,b0);
+  if(b0>63)  return Uint8Array.of(b1|0x40,b0);
+  return Uint8Array.of(b0);
+}
+function encStr(s){ const b=new TextEncoder().encode(s); const l=encCI(b.length); const o=new Uint8Array(l.length+b.length); o.set(l,0); o.set(b,l.length); return o; }
+function replaceAllSeq(blob, oldSeq, newSeq){
+  // blob/oldSeq/newSeq: Uint8Array. returns {data, count}
+  // Correctly preserves all non-matching bytes (scan pos and gap start
+  // are tracked separately so false-positive first bytes are kept).
+  const ob = oldSeq, nb = newSeq;
+  let count=0, scan=0, gap=0; const parts=[]; let total=0;
+  while(true){
+    const j = blob.indexOf(ob[0], scan);
+    if(j<0){ parts.push(blob.subarray(gap)); total+=blob.length-gap; break; }
+    let match=true;
+    if(j+ob.length>blob.length) match=false;
+    else { for(let k=1;k<ob.length;k++){ if(blob[j+k]!==ob[k]){match=false;break;} } }
+    if(!match){ scan=j+1; continue; }
+    parts.push(blob.subarray(gap,j)); total+=j-gap;
+    parts.push(nb); total+=nb.length;
+    count++; scan=gap=j+ob.length;
+  }
+  if(!count) return {data:blob,count:0};
+  const out=new Uint8Array(total); let o=0;
+  for(const p of parts){ out.set(p,o); o+=p.length; }
+  return {data:out,count};
+}
+/* ============ CRC32 ============ */
+const CRC_T = (()=>{ const t=new Uint32Array(256); for(let i=0;i<256;i++){let c=i; for(let k=0;k<8;k++)c=c&1?0xEDB88320^(c>>>1):c>>>1; t[i]=c>>>0;} return t; })();
+function crc32(u8){ let c=0xFFFFFFFF; for(let i=0;i<u8.length;i++) c=CRC_T[(c^u8[i])&255]^(c>>>8); return (c^0xFFFFFFFF)>>>0; }
+/* ============ header ============ */
+const MAGIC = new TextEncoder().encode("eXERD File");
+const LOCAL_SIG = [0x50,0x4B,0x03,0x04], DESC_SIG = [0x50,0x4B,0x07,0x08];
+function parseHeader(u8){
+  if(u8.length < 10+16) return null;
+  for(let i=0;i<10;i++) if(u8[i]!==MAGIC[i]) return null;
+  const dv=new DataView(u8.buffer,u8.byteOffset,u8.byteLength);
+  const major=dv.getInt32(10), minor=dv.getInt32(14), micro=dv.getInt32(18);
+  const qlen=dv.getInt32(22);
+  if(qlen<0||qlen>4096) throw new Error("insane qualifier len "+qlen);
+  const qual=new TextDecoder().decode(u8.subarray(26,26+qlen));
+  const zlen = typeof dv.getBigInt64==="function" ? Number(dv.getBigInt64(26+qlen)) :
+    dv.getInt32(26+qlen)*0x100000000 + dv.getUint32(26+qlen+4);
+  return {major,minor,micro,qual,version:[major,minor,micro,qual],
+          versionStr:formatOSGI([major,minor,micro,qual]),
+          zippedXmlLen:zlen, headerLen:26+qlen+8};
+}
+function buildHeader(v, zlen){
+  const q=new TextEncoder().encode(v[3]);
+  const out=new Uint8Array(10+4+4+4+4+q.length+8);
+  out.set(MAGIC,0);
+  const dv=new DataView(out.buffer);
+  dv.setInt32(10,v[0]); dv.setInt32(14,v[1]); dv.setInt32(18,v[2]); dv.setInt32(22,q.length);
+  out.set(q,26);
+  if(typeof dv.setBigInt64==="function") dv.setBigInt64(26+q.length, BigInt(zlen));
+  else { dv.setInt32(26+q.length, Math.floor(zlen/0x100000000)); dv.setUint32(26+q.length+4, zlen>>>0); }
+  return out;
+}
+/* ============ streaming zip entries ============ */
+function sigAt(u8,o){ return [u8[o],u8[o+1],u8[o+2],u8[o+3]].join(","); }
+function parseEntries(u8, start){
+  const entries=[]; let off=start;
+  const LS=LOCAL_SIG.join(","), DS=DESC_SIG.join(",");
+  while(off<u8.length){
+    if(off+4>u8.length) break;
+    const s=sigAt(u8,off);
+    if(s==="80,75,1,2"||s==="80,75,5,6"||s==="80,75,6,6"||s==="80,75,6,7") break;
+    if(s!==LS) break;
+    if(off+30>u8.length) throw new Error("truncated local header @"+off);
+    const dv=new DataView(u8.buffer,u8.byteOffset+off,u8.byteLength-off);
+    const ver=dv.getUint16(4,true), flag=dv.getUint16(6,true), method=dv.getUint16(8,true);
+    const mtime=dv.getUint16(10,true), mdate=dv.getUint16(12,true);
+    const fnLen=dv.getUint16(26,true), exLen=dv.getUint16(28,true);
+    const fname=u8.subarray(off+30,off+30+fnLen);
+    const ds=off+30+fnLen+exLen;
+    if(flag&0x08){
+      // find descriptor
+      let d=-1;
+      for(let i=ds;i+4<=u8.length;i++){ if(u8[i]===0x50&&u8[i+1]===0x4B&&u8[i+2]===0x07&&u8[i+3]===0x08){d=i;break;} }
+      if(d<0) throw new Error("missing descriptor for "+new TextDecoder().decode(fname));
+      const dd=new DataView(u8.buffer,u8.byteOffset+d,u8.byteLength-d);
+      const crc=dd.getUint32(4,true), cs=dd.getUint32(8,true), us=dd.getUint32(12,true);
+      entries.push({offset:off,ver,flag,method,mtime,mdate,fname,
+        comp:u8.subarray(ds,d),crc,cs,us,hasDesc:true,totalLen:d+16-off});
+      off=d+16;
+    } else {
+      const dd=new DataView(u8.buffer,u8.byteOffset+off,u8.byteLength-off);
+      const crc=dd.getUint32(14,true), cs=dd.getUint32(18,true), us=dd.getUint32(22,true);
+      entries.push({offset:off,ver,flag,method,mtime,mdate,fname,
+        comp:u8.subarray(ds,ds+cs),crc,cs,us,hasDesc:false,totalLen:ds+cs-off});
+      off=ds+cs;
+    }
+  }
+  return entries;
+}
+function buildEntry(fname, raw, mtime, mdate, comp){
+  const crc=crc32(raw);
+  const head=new Uint8Array(30+fname.length);
+  head.set([0x50,0x4B,0x03,0x04],0);
+  const dv=new DataView(head.buffer);
+  dv.setUint16(4,20,true); dv.setUint16(6,0x0808,true); dv.setUint16(8,8,true);
+  dv.setUint16(10,mtime,true); dv.setUint16(12,mdate,true);
+  dv.setUint32(14,0,true); dv.setUint32(18,0,true); dv.setUint32(22,0,true);
+  dv.setUint16(26,fname.length,true); dv.setUint16(28,0,true);
+  head.set(fname,30);
+  const tail=new Uint8Array(16);
+  const dt=new DataView(tail.buffer);
+  tail.set([0x50,0x4B,0x07,0x08],0);
+  dt.setUint32(4,crc,true); dt.setUint32(8,comp.length,true); dt.setUint32(12,raw.length,true);
+  const out=new Uint8Array(head.length+comp.length+tail.length);
+  out.set(head,0); out.set(comp,head.length); out.set(tail,head.length+comp.length);
+  return out;
+}
+/* ============ deflate-raw via Web Streams ============ */
+async function inflateRaw(u8){
+  const ds=new DecompressionStream("deflate-raw");
+  const w=ds.writable.getWriter(); w.write(u8); w.close();
+  const chunks=[]; const r=ds.readable.getReader();
+  while(true){ const {done,value}=await r.read(); if(done) break; chunks.push(value); }
+  let n=0; for(const c of chunks)n+=c.length;
+  const out=new Uint8Array(n); let o=0;
+  for(const c of chunks){out.set(c,o);o+=c.length;}
+  return out;
+}
+async function deflateRaw(u8){
+  const cs=new CompressionStream("deflate-raw");
+  const w=cs.writable.getWriter(); w.write(u8); w.close();
+  const chunks=[]; const r=cs.readable.getReader();
+  while(true){ const {done,value}=await r.read(); if(done) break; chunks.push(value); }
+  let n=0; for(const c of chunks)n+=c.length;
+  const out=new Uint8Array(n); let o=0;
+  for(const c of chunks){out.set(c,o);o+=c.length;}
+  return out;
+}
+/* ============ XML / binary patch ============ */
+const VERLIKE = /\b\d+\.\d+\.\d+\.\d{8}-\d+\b/g;
+function patchXML(text, target, strip){
+  const info={replaced:0,rmModel:0,rmDb:0,rmClear:0};
+  text=text.replace(/(<e:Document\b[^>]*?\sversion=")([^"]*)(")/,(m,a,b,c)=>{info.replaced++;return a+target+c;});
+  if(strip){
+    text=text.replace(/\smodelVersion="[^"]*"/g,()=>{info.rmModel++;return "";});
+    text=text.replace(/\sdatabaseVersion="[^"]*"/g,()=>{info.rmDb++;return "";});
+    text=text.replace(/\suseClearTableName="[^"]*"/g,()=>{info.rmClear++;return "";});
+  } else {
+    if(text.includes('modelVersion="')) text=text.replace(/(\smodelVersion=")[^"]*(")/g,"$1"+target+"$2");
+    if(text.includes('databaseVersion="')) text=text.replace(/(\sdatabaseVersion=")[^"]*(")/g,"$1"+target+"$2");
+  }
+  return {text,info};
+}
+function patchBinary(raw, oldVers, target, strip){
+  const info={verReplaced:0,renamed:{}};
+  const olds=[...new Set(oldVers.filter(Boolean))].sort((a,b)=>b.length-a.length);
+  for(const o of olds){
+    if(o===target) continue;
+    const r=replaceAllSeq(raw, concat(encCI(o.length),te(o)), concat(encCI(target.length),te(target)));
+    raw=r.data; info.verReplaced+=r.count;
+  }
+  // catch-all remaining higher version-like strings
+  const probe=td().decode(raw);
+  const left=[...new Set(probe.match(VERLIKE)||[])].sort((a,b)=>b.length-a.length);
+  const tv=parseOSGI(target);
+  for(const lv of left){
+    if(lv===target) continue;
+    try{ if(compareOSGI(parseOSGI(lv),tv)<=0) continue; }catch(e){ continue; }
+    const r=replaceAllSeq(raw, concat(encCI(lv.length),te(lv)), concat(encCI(target.length),te(target)));
+    raw=r.data; info.verReplaced+=r.count;
+  }
+  if(strip){
+    const ren=[["modelVersion","customDataTypeFile"],["databaseVersion","customDataTypeFile"],["useClearTableName","useNoteBackground"]];
+    for(const [a,b] of ren){
+      const r=replaceAllSeq(raw, concat(encCI(a.length),te(a)), concat(encCI(b.length),te(b)));
+      raw=r.data; if(r.count) info.renamed[a+"->"+b]=r.count;
+    }
+  }
+  return {data:raw,info};
+}
+const _te=new TextEncoder(), _td=new TextDecoder();
+function te(s){return _te.encode(s);} function td(){return _td;}
+function concat(a,b){const o=new Uint8Array(a.length+b.length);o.set(a,0);o.set(b,a.length);return o;}
+/* ============ UI ============ */
+const $=id=>document.getElementById(id);
+const logEl=$("log"), infoEl=$("info");
+function log(m){ logEl.textContent+="\n"+m; }
+let loaded=null; // {buf, header, entries, xmlText, xmlEntryIdx, binEntryIdx}
+function setInfo(t){ infoEl.textContent=t; }
+$("preset").addEventListener("change",e=>{ if(e.target.value) $("target").value=e.target.value; });
+$("target").addEventListener("input",e=>{
+  try{ const v=parseOSGI(e.target.value); $("strip").checked = (v[0]===2); }catch(err){}
+});
+const drop=$("drop"), fileInp=$("file");
+drop.addEventListener("click",()=>fileInp.click());
+drop.addEventListener("dragover",e=>{e.preventDefault();drop.classList.add("over");});
+drop.addEventListener("dragleave",()=>drop.classList.remove("over"));
+drop.addEventListener("drop",e=>{e.preventDefault();drop.classList.remove("over"); if(e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0]);});
+fileInp.addEventListener("change",()=>{ if(fileInp.files[0]) loadFile(fileInp.files[0]); });
+async function loadFile(f){
+  logEl.textContent="Loading "+f.name+" ("+f.size+" bytes)…";
+  $("fname").textContent=f.name;
+  try{
+    const buf=new Uint8Array(await f.arrayBuffer());
+    const header=parseHeader(buf);
+    if(!header){ setInfo(`file: ${f.name} (${buf.length} bytes)\nheader: NONE (legacy headerless file)\n→ no version gate; already loadable.`); loaded=null; $("dl").disabled=true; log("headerless file, nothing to do."); return; }
+    const entries=parseEntries(buf, header.headerLen);
+    let lines=[];
+    lines.push(`file: ${f.name} (${buf.length} bytes)`);
+    lines.push(`header version : ${header.versionStr} (major=${header.major} minor=${header.minor} micro=${header.micro} qualifier='${header.qual}')`);
+    lines.push(`header zippedXmlLen: ${header.zippedXmlLen}  headerLen: ${header.headerLen}`);
+    lines.push(`zip entries: ${entries.length}`);
+    let xmlText=null, xmlIdx=-1, binIdx=-1;
+    for(let i=0;i<entries.length;i++){
+      const e=entries[i];
+      const fn=td().decode(e.fname);
+      try{
+        const raw=await inflateRaw(e.comp);
+        const okCrc = crc32(raw)===e.crc ? "crcOK" : `crcMISMATCH(calc=${crc32(raw).toString(16)} stored=${e.crc.toString(16)})`;
+        const okSize = (e.comp.length===e.cs&&raw.length===e.us)?"sizeOK":"sizeMISMATCH";
+        lines.push(`  [${i}] ${fn} comp=${e.comp.length}B (cs=${e.cs} us=${e.us}) decomp=${raw.length}B ${okCrc} ${okSize}`);
+        if(fn==="xml-content.xml"){ xmlIdx=i; xmlText=td().decode(raw); }
+        if(fn==="binary-content") binIdx=i;
+      }catch(err){ lines.push(`  [${i}] ${fn} DECOMPRESS FAILED: ${err.message}`); }
+    }
+    if(xmlText){
+      const m=xmlText.match(/<e:Document\b[^>]*>/);
+      if(m) lines.push("xml <e:Document>: "+(m[0].length>500?m[0].slice(0,500)+"…":m[0]));
+      for(const a of ["modelVersion=","databaseVersion=","useClearTableName="])
+        if(xmlText.includes(a)) lines.push("  xml contains newer attribute: "+a.slice(0,-1));
+    }
+    if(binIdx>=0){
+      try{
+        const braw=await inflateRaw(entries[binIdx].comp);
+        const vers=[...new Set((td().decode(braw).match(VERLIKE)||[]))];
+        if(vers.length) lines.push("binary version-like strings: "+JSON.stringify(vers));
+        for(const feat of ["modelVersion","databaseVersion","useClearTableName"]){
+          const seq=concat(encCI(feat.length),te(feat));
+          if(countSeqArr(braw,seq)) lines.push(`  binary contains newer feature: ${feat}`);
+        }
+      }catch(err){ lines.push("  binary scan failed: "+err.message); }
+    }
+    if(entries.length&&entries[0].totalLen!==header.zippedXmlLen)
+      lines.push(`WARNING: header zippedXmlLen (${header.zippedXmlLen}) != first-entry total (${entries[0].totalLen})`);
+    setInfo(lines.join("\n"));
+    loaded={buf,header,entries,xmlText,xmlIdx,binIdx,name:f.name};
+    $("dl").disabled=false;
+    try{ const v=parseOSGI($("target").value); if(compareOSGI(v,header.version)>0) log(`NOTE: target ${formatOSGI(v)} is HIGHER than source ${header.versionStr}.`);}catch(e){}
+    log("loaded OK. Choose target and press Downgrade.");
+  }catch(err){ setInfo("FAILED: "+err.message); log("ERROR: "+(err.stack||err.message)); }
+}
+function countSeqArr(hay, needle){
+  let c=0;
+  for(let i=0;i+needle.length<=hay.length;i++){ let ok=true; for(let k=0;k<needle.length;k++){if(hay[i+k]!==needle[k]){ok=false;break;}} if(ok){c++;i+=needle.length-1;} }
+  return c;
+}
+$("dl").addEventListener("click", async ()=>{
+  if(!loaded) return;
+  const btn=$("dl"); btn.disabled=true;
+  try{
+    const targetRaw=$("target").value.trim();
+    const tv=parseOSGI(targetRaw); const target=formatOSGI(tv);
+    const strip=$("strip").checked;
+    log(`Downgrading ${loaded.header.versionStr} → ${target} (strip=${strip})…`);
+    const oldVers=[loaded.header.versionStr];
+    if(loaded.xmlText){
+      const m=loaded.xmlText.match(/<e:Document\b[^>]*?\sversion="([^"]*)"/);
+      if(m&&!oldVers.includes(m[1])) oldVers.push(m[1]);
+      for(const mm of loaded.xmlText.matchAll(/\s(?:modelVersion|databaseVersion)="([^"]*)"/g))
+        if(!oldVers.includes(mm[1])) oldVers.push(mm[1]);
+    }
+    // xml
+    const {text:newXmlText}=patchXML(loaded.xmlText,target,strip);
+    const newXml=te(newXmlText);
+    // binary
+    let newBin=null;
+    if(loaded.binIdx>=0){
+      const braw=await inflateRaw(loaded.entries[loaded.binIdx].comp);
+      const r=patchBinary(braw,oldVers,target,strip);
+      newBin=r.data;
+      log(`binary patch: version replaced ×${r.info.verReplaced}, renamed ${JSON.stringify(r.info.renamed)}`);
+    }
+    // rebuild
+    const parts=[];
+    for(let i=0;i<loaded.entries.length;i++){
+      const e=loaded.entries[i];
+      if(i===loaded.xmlIdx){
+        const comp=await deflateRaw(newXml);
+        parts.push(buildEntry(e.fname,newXml,e.mtime,e.mdate,comp));
+      } else if(i===loaded.binIdx){
+        const comp=await deflateRaw(newBin);
+        parts.push(buildEntry(e.fname,newBin,e.mtime,e.mdate,comp));
+      } else {
+        parts.push(loaded.buf.subarray(e.offset,e.offset+e.totalLen));
+      }
+    }
+    const newHead=buildHeader(tv,parts[loaded.xmlIdx].length);
+    let total=newHead.length; for(const p of parts)total+=p.length;
+    const out=new Uint8Array(total); let o=0;
+    out.set(newHead,o);o+=newHead.length;
+    for(const p of parts){out.set(p,o);o+=p.length;}
+    const base=loaded.name.replace(/\.exerd$/i,"");
+    const outName=`${base}_downgraded_to_${target}.exerd`;
+    const blob=new Blob([out],{type:"application/octet-stream"});
+    const a=document.createElement("a");
+    a.href=URL.createObjectURL(blob); a.download=outName; a.click();
+    setTimeout(()=>URL.revokeObjectURL(a.href),5000);
+    log(`OK → ${outName} (${out.length} bytes). Verify by dropping the output back here.`);
+  }catch(err){ log("ERROR: "+(err.stack||err.message)); }
+  finally{ btn.disabled=false; }
+});
+</script>
+</body>
+</html>
